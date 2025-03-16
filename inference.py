@@ -19,6 +19,7 @@
 
 from argparse import ArgumentParser
 from typing import List, Dict
+import time
 import torch
 from transformers import AutoModelForCausalLM
 import PIL.Image
@@ -90,10 +91,40 @@ def main(args):
         {"role": "<|Assistant|>", "content": ""},
     ]
 
+    ## single image conversation example
+    ## Please note that <|ref|> and <|/ref|> are designed specifically for the object localization feature. These special tokens are not required for normal conversations.
+    ## If you would like to experience the grounded captioning functionality (responses that include both object localization and reasoning), you need to add the special token <|grounding|> at the beginning of the prompt. Examples could be found in Figure 9 of our paper.
+    # conversation = [
+    #     {
+    #         "role": "<|User|>",
+    #         "content": "<image>\n<|ref|>The giraffe at the back.<|/ref|>.",
+    #         "images": ["./images/visual_grounding_1.jpeg"],
+    #     },
+    #     {"role": "<|Assistant|>", "content": ""},
+    # ]
+
+    # multiple images/interleaved image-text
+    # conversation = [
+    #     {
+    #         "role": "<|User|>",
+    #         "content": "This is image_1: <image>\n"
+    #                 "This is image_2: <image>\n"
+    #                 "This is image_3: <image>\n Can you tell me what are in the images?",
+    #         "images": [
+    #             "images/multi_image_1.jpeg",
+    #             "images/multi_image_2.jpeg",
+    #             "images/multi_image_3.jpeg",
+    #         ],
+    #     },
+    #     {"role": "<|Assistant|>", "content": ""}
+    # ]
+
 
     # load images and prepare for inputs
     pil_images = load_pil_images(conversation)
     print(f"len(pil_images) = {len(pil_images)}")
+    for img in pil_images:
+        print(f"img.size = {img.size}")
 
     prepare_inputs = vl_chat_processor.__call__(
         conversations=conversation,
@@ -101,6 +132,9 @@ def main(args):
         force_batchify=True,
         system_prompt=""
     ).to(vl_gpt.device, dtype=dtype)
+
+    print("Input text length: ", prepare_inputs.input_ids.numel() - prepare_inputs.num_image_tokens)
+    print("Input image tokens length: ", prepare_inputs.num_image_tokens)
 
     with torch.no_grad():
 
@@ -118,6 +152,31 @@ def main(args):
                 chunk_size=args.chunk_size
             )
 
+        # profile TTFT
+        ttft = 0
+        for _ in range(5):
+            torch.cuda.synchronize()
+            tst = time.time()
+            output = vl_gpt.forward(
+                inputs_embeds=inputs_embeds,
+                input_ids=None,
+                images=prepare_inputs.images,
+                images_seq_mask=prepare_inputs.images_seq_mask,
+                images_spatial_crop=prepare_inputs.images_spatial_crop,
+                attention_mask=prepare_inputs.attention_mask,
+                past_key_values=past_key_values,
+            )
+            torch.cuda.synchronize()
+            ted = time.time()
+            ttft += (ted - tst)
+        print(
+            "LLM TTFT: {:.6f} s for {} tokens".format(
+                (ttft / 5), inputs_embeds.shape[1]
+            )
+        )
+
+        torch.cuda.synchronize()
+        tst = time.time()
         # run the model to get the response
         outputs = vl_gpt.generate(
             # inputs_embeds=inputs_embeds[:, -1:],
@@ -145,6 +204,11 @@ def main(args):
 
             use_cache=True,
         )
+        torch.cuda.synchronize()
+        ted = time.time()
+        assert inputs_embeds.shape[1] == len(prepare_inputs.input_ids[0]), f"inputs_embeds.shape[1] = {inputs_embeds.shape[1]}, len(prepare_inputs.input_ids[0]) = {len(prepare_inputs.input_ids[0])}"
+        num_generated_tokens = len(outputs[0]) - len(prepare_inputs.input_ids[0])
+        print("Decoding througput: {:.6f} tokens/s".format(num_generated_tokens / (ted - tst)))
 
         answer = tokenizer.decode(outputs[0][len(prepare_inputs.input_ids[0]):].cpu().tolist(), skip_special_tokens=False)
         print(f"{prepare_inputs['sft_format'][0]}", answer)

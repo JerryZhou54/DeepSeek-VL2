@@ -2,6 +2,7 @@ from attrdict import AttrDict
 from dataclasses import dataclass
 import logging
 import gc
+import time
 
 from einops import rearrange, repeat
 from typing import Optional, List, Tuple, Callable, Union
@@ -374,11 +375,22 @@ class DeepseekVLV2ForCausalLM(DeepseekVLV2PreTrainedModel):
         if total_tiles.shape[0] == 0:
             return self.language.get_input_embeddings()(input_ids)
 
+        print("Image Tiles shape: ", total_tiles.shape)
         # [batch_all_tiles, vit_seq_len, c]
+        torch.cuda.synchronize()
+        tst = time.time()
         images_feature = self.vision(total_tiles)
+        torch.cuda.synchronize()
+        ted = time.time()
+        print(f"vit forward time: {ted - tst} s")
 
         # [batch_all_tiles, hw, D]
+        torch.cuda.synchronize()
+        tst = time.time()
         images_embeds = self.projector(images_feature)
+        torch.cuda.synchronize()
+        ted = time.time()
+        print(f"projector forward time: {ted - tst} s")
         _, hw, n_dim = images_embeds.shape
         h = w = int(hw ** 0.5)
 
