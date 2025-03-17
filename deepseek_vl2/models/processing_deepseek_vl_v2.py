@@ -88,6 +88,7 @@ class BatchCollateOutput(DictOutput):
     images_seq_mask: torch.BoolTensor
     images_spatial_crop: torch.LongTensor
     seq_lens: List[int]
+    num_image_tokens: List[int]
 
     def to(self, device, dtype=torch.bfloat16):
         self.input_ids = self.input_ids.to(device)
@@ -669,7 +670,8 @@ class DeepseekVLV2Processor(ProcessorMixin):
             images_seq_mask=batched_images_seq_mask,
             images_spatial_crop=batched_images_spatial_crop,
             sft_format=batched_sft_format,
-            seq_lens=seq_lens
+            seq_lens=seq_lens,
+            num_image_tokens=sample_list[0].num_image_tokens
         )
 
         return batched_samples

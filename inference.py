@@ -133,48 +133,61 @@ def main(args):
         system_prompt=""
     ).to(vl_gpt.device, dtype=dtype)
 
-    print("Input text length: ", prepare_inputs.input_ids.numel() - prepare_inputs.num_image_tokens)
+    print("Input image spatial crop: ", prepare_inputs.images_spatial_crop)
+    print("Input text length: ", sum(prepare_inputs.seq_lens) - sum(prepare_inputs.num_image_tokens))
     print("Input image tokens length: ", prepare_inputs.num_image_tokens)
 
     with torch.no_grad():
-
+        ttft = 0
         if args.chunk_size == -1:
+            # torch.cuda.reset_peak_memory_stats()
             inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
             past_key_values = None
+            # max_memory_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024
+            # print(f"ViT + Projector memory allocated: {max_memory_allocated} MB")
         else:
+            torch.cuda.reset_peak_memory_stats()
             # incremental_prefilling when using 40G GPU for vl2-small
-            inputs_embeds, past_key_values = vl_gpt.incremental_prefilling(
-                input_ids=prepare_inputs.input_ids,
-                images=prepare_inputs.images,
-                images_seq_mask=prepare_inputs.images_seq_mask,
-                images_spatial_crop=prepare_inputs.images_spatial_crop,
-                attention_mask=prepare_inputs.attention_mask,
-                chunk_size=args.chunk_size
-            )
+            for _ in range(5):
+                torch.cuda.synchronize()
+                tst = time.time()
+                inputs_embeds, past_key_values = vl_gpt.incremental_prefilling(
+                    input_ids=prepare_inputs.input_ids,
+                    images=prepare_inputs.images,
+                    images_seq_mask=prepare_inputs.images_seq_mask,
+                    images_spatial_crop=prepare_inputs.images_spatial_crop,
+                    attention_mask=prepare_inputs.attention_mask,
+                    chunk_size=args.chunk_size
+                )
+                ted = time.time()
+                ttft += (ted - tst)
 
         # profile TTFT
-        ttft = 0
-        for _ in range(5):
-            torch.cuda.synchronize()
-            tst = time.time()
-            output = vl_gpt.forward(
-                inputs_embeds=inputs_embeds,
-                input_ids=None,
-                images=prepare_inputs.images,
-                images_seq_mask=prepare_inputs.images_seq_mask,
-                images_spatial_crop=prepare_inputs.images_spatial_crop,
-                attention_mask=prepare_inputs.attention_mask,
-                past_key_values=past_key_values,
-            )
-            torch.cuda.synchronize()
-            ted = time.time()
-            ttft += (ted - tst)
+        if args.chunk_size == -1:
+            for _ in range(5):
+                torch.cuda.synchronize()
+                tst = time.time()
+                output = vl_gpt.forward(
+                    inputs_embeds=inputs_embeds,
+                    input_ids=None,
+                    images=prepare_inputs.images,
+                    images_seq_mask=prepare_inputs.images_seq_mask,
+                    images_spatial_crop=prepare_inputs.images_spatial_crop,
+                    attention_mask=prepare_inputs.attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=False,
+                )
+                torch.cuda.synchronize()
+                ted = time.time()
+                ttft += (ted - tst)
         print(
             "LLM TTFT: {:.6f} s for {} tokens".format(
                 (ttft / 5), inputs_embeds.shape[1]
             )
         )
 
+        if args.chunk_size == -1:
+            torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         tst = time.time()
         # run the model to get the response
@@ -194,21 +207,30 @@ def main(args):
             eos_token_id=tokenizer.eos_token_id,
             max_new_tokens=512,
 
-            # do_sample=False,
-            # repetition_penalty=1.1,
-
-            do_sample=True,
-            temperature=0.4,
-            top_p=0.9,
+            do_sample=False,
             repetition_penalty=1.1,
 
+            # do_sample=True,
+            # temperature=0.4,
+            # top_p=0.9,
+            # repetition_penalty=1.1,
+
             use_cache=True,
+            return_dict_in_generate=True
         )
+        num_layers = len(outputs.past_key_values)
+        num_elements = 2 * outputs.past_key_values[0][0].numel()
+        dtype_size = 2 # bf16
+        kv_cache_size = num_layers * num_elements * dtype_size / (1024 * 1024)
+        print(f"KV Cache size: {kv_cache_size} MB")
+        outputs = outputs.sequences
+        
         torch.cuda.synchronize()
         ted = time.time()
-        assert inputs_embeds.shape[1] == len(prepare_inputs.input_ids[0]), f"inputs_embeds.shape[1] = {inputs_embeds.shape[1]}, len(prepare_inputs.input_ids[0]) = {len(prepare_inputs.input_ids[0])}"
+        assert inputs_embeds.shape[1] == len(prepare_inputs.input_ids[0]), f"inputs_embeds.shape = {inputs_embeds.shape}, len(prepare_inputs.input_ids) = {len(prepare_inputs.input_ids)}"
         num_generated_tokens = len(outputs[0]) - len(prepare_inputs.input_ids[0])
         print("Decoding througput: {:.6f} tokens/s".format(num_generated_tokens / (ted - tst)))
+        print(f"LLM max memory allocated: {torch.cuda.max_memory_allocated() / 1024 / 1024} MB")
 
         answer = tokenizer.decode(outputs[0][len(prepare_inputs.input_ids[0]):].cpu().tolist(), skip_special_tokens=False)
         print(f"{prepare_inputs['sft_format'][0]}", answer)
